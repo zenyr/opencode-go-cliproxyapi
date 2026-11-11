@@ -1317,3 +1317,11 @@ func TestClaudeCallIDAndItemIDAreOneBlock(t *testing.T) {
 		t.Errorf("arg delta = %v", d)
 	}
 }
+
+func TestPassthroughFailedUsageLimitIsCredentialScoped(t *testing.T) {
+	_, _, eErr := runStream(t, "openai-response",
+		frame("response.failed", `{"response":{"error":{"code":"GoUsageLimitError","message":"Go usage limit exceeded"}}}`))
+	if eErr == nil || eErr.Class != errclass.ClassQuota || !eErr.CredentialScoped || eErr.StatusCode != 429 {
+		t.Fatalf("want credential-scoped quota 429, got %+v", eErr)
+	}
+}

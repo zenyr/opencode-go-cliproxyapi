@@ -3,8 +3,6 @@ package errclass
 import (
 	"errors"
 	"testing"
-
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 )
 
 func TestClassConstants(t *testing.T) {
@@ -48,7 +46,7 @@ func TestFromStatus(t *testing.T) {
 		{"404 invalid model", 404, "no such model", ClassInvalidModel, false},
 		{"429 rate limit", 429, "too many", ClassRateLimit, true},
 		{"429 quota text upgrades", 429, "quota exceeded for project", ClassQuota, true},
-		{"429 Go usage limit", 429, "GoUsageLimitError", ClassRateLimit, true},
+		{"429 Go usage limit text alone stays rate limit", 429, "GoUsageLimitError", ClassRateLimit, true},
 		{"403 quota text upgrades", 403, "quota exhausted", ClassQuota, true},
 		{"402 quota text bills as quota", 402, "quota depleted", ClassQuota, true},
 		{"408 client timeout unsupported", 408, "request timeout", ClassUnsupported, false},
@@ -113,8 +111,8 @@ func TestPostFirstByteNetwork(t *testing.T) {
 	if e.Retryable {
 		t.Error("Retryable = true, want false (§7: post-first-byte failures must never retry)")
 	}
-	if e.StatusCode != 0 {
-		t.Errorf("StatusCode = %+v", e)
+	if e.StatusCode != 502 || e.RoutingCode != CodeStreamTruncated {
+		t.Errorf("want 502 stream_truncated, got %+v", e)
 	}
 	want := "stream read after first byte: Bearer [redacted] dropped"
 	if e.Message != want {
@@ -125,7 +123,7 @@ func TestPostFirstByteNetwork(t *testing.T) {
 func TestToEnvelopeError(t *testing.T) {
 	in := &Error{Class: ClassAuth, Message: "Bearer sk-secret failed", StatusCode: 401}
 	got := ToEnvelopeError(in)
-	want := pluginabi.Error{Code: "auth_failure", Message: "Bearer [redacted] failed", Retryable: false, HTTPStatus: 401}
+	want := WireError{Code: "auth_failure", Message: "Bearer [redacted] failed", Retryable: false, HTTPStatus: 401}
 	if got != want {
 		t.Errorf("ToEnvelopeError = %+v, want %+v", got, want)
 	}
@@ -228,5 +226,48 @@ func TestRedactQueryKeys(t *testing.T) {
 		if again := Redact(got); again != got {
 			t.Errorf("Redact not idempotent on %q: %q", got, again)
 		}
+	}
+}
+
+func TestFromStatusCodeQuotaScope(t *testing.T) {
+	tests := []struct {
+		name   string
+		status int
+		code   string
+		msg    string
+		class  Class
+		scoped bool
+	}{
+		{"Go usage limit type is a credential quota", 429, "GoUsageLimitError", "Go usage limit exceeded", ClassQuota, true},
+		{"free usage limit type", 429, "FreeUsageLimitError", "limit", ClassQuota, true},
+		{"quota text on 429 is credential-scoped", 429, "", "quota exceeded", ClassQuota, true},
+		{"plain throttle stays per-model", 429, "rate_limit_error", "slow down", ClassRateLimit, false},
+		{"budget policy is not an account cap", 429, "BudgetLimitError", "budget reached", ClassRateLimit, false},
+		{"402 quota is not credential-scoped", 402, "insufficient_quota", "pay", ClassQuota, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := FromStatusCode(tc.status, tc.code, tc.msg)
+			if got.Class != tc.class || got.CredentialScoped != tc.scoped {
+				t.Errorf("FromStatusCode(%d,%q,%q) = %+v", tc.status, tc.code, tc.msg, got)
+			}
+		})
+	}
+}
+
+func TestToEnvelopeErrorRoutingFields(t *testing.T) {
+	quota := FromStatusCode(429, "GoUsageLimitError", "Go usage limit exceeded")
+	quota.RetryAfterSeconds = 30
+	got := ToEnvelopeError(quota)
+	want := WireError{Code: "quota_exhaustion", Message: "Go usage limit exceeded", Retryable: true,
+		HTTPStatus: 429, RetryAfterSeconds: 30, CredentialScoped: true}
+	if got != want {
+		t.Errorf("quota envelope = %+v, want %+v", got, want)
+	}
+	if got := ToEnvelopeError(FromNetwork(errors.New("dial"))).Code; got != CodeTransientTransport {
+		t.Errorf("network code = %q, want %q", got, CodeTransientTransport)
+	}
+	if got := ToEnvelopeError(DownstreamLifecycle("gone")).Code; got != CodeConnectionLifecycle {
+		t.Errorf("downstream code = %q, want %q", got, CodeConnectionLifecycle)
 	}
 }

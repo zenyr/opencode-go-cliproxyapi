@@ -2,9 +2,11 @@ package shared
 
 import (
 	"encoding/json"
+	"net/http"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"opencode-go-cliproxyapi/internal/errclass"
 )
@@ -1583,5 +1585,50 @@ func TestDecodeClaudeMessages(t *testing.T) {
 		if eErr == nil || eErr.Class != errclass.ClassTranslation {
 			t.Errorf("%s: want ClassTranslation, got %+v", name, eErr)
 		}
+	}
+}
+
+func TestUpstreamStatusErrorReadsQuotaType(t *testing.T) {
+	body := []byte(`{"type":"error","error":{"type":"GoUsageLimitError","message":"Go usage limit exceeded"}}`)
+	e := UpstreamStatusError(429, body)
+	if e.Class != errclass.ClassQuota || !e.CredentialScoped || e.Message != "Go usage limit exceeded" {
+		t.Fatalf("classification = %+v", e)
+	}
+	openai := []byte(`{"error":{"type":"requests","code":"insufficient_quota","message":"no credit"}}`)
+	if e := UpstreamStatusError(429, openai); e.Class != errclass.ClassQuota || !e.CredentialScoped {
+		t.Fatalf("openai quota code = %+v", e)
+	}
+	throttle := []byte(`{"error":{"type":"rate_limit_error","message":"slow down"}}`)
+	if e := UpstreamStatusError(429, throttle); e.Class != errclass.ClassRateLimit || e.CredentialScoped {
+		t.Fatalf("throttle = %+v", e)
+	}
+}
+
+func TestRetryAfterSeconds(t *testing.T) {
+	now := time.Date(2026, 11, 11, 7, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name  string
+		value string
+		want  int
+	}{
+		{"absent", "", 0},
+		{"delta seconds", "30", 30},
+		{"zero", "0", 0},
+		{"negative", "-5", 0},
+		{"http date", now.Add(90 * time.Second).Format(http.TimeFormat), 90},
+		{"past date", now.Add(-time.Minute).Format(http.TimeFormat), 0},
+		{"garbage", "soon", 0},
+		{"capped", "99999999", int(maxRetryAfter / time.Second)},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			h := http.Header{}
+			if tc.value != "" {
+				h.Set("Retry-After", tc.value)
+			}
+			if got := RetryAfterSeconds(h, now); got != tc.want {
+				t.Errorf("RetryAfterSeconds(%q) = %d, want %d", tc.value, got, tc.want)
+			}
+		})
 	}
 }

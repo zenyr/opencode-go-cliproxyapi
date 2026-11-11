@@ -10,6 +10,8 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+
+	"opencode-go-cliproxyapi/internal/errclass"
 )
 
 func decodePayload(t *testing.T, c capturedCall) map[string]any {
@@ -303,7 +305,7 @@ func TestBridgeStreamEmit(t *testing.T) {
 
 func TestBridgeStreamCloseDownstream(t *testing.T) {
 	f := &fakeCaller{}
-	if err := NewHostBridge(f.call).StreamCloseDownstream("down-stream-7", ""); err != nil {
+	if err := NewHostBridge(f.call).StreamCloseDownstream("down-stream-7", nil); err != nil {
 		t.Fatalf("StreamCloseDownstream: %v", err)
 	}
 	calls := f.callsOf(pluginabi.MethodHostStreamClose)
@@ -315,16 +317,18 @@ func TestBridgeStreamCloseDownstream(t *testing.T) {
 		t.Fatalf("empty-error wire payload should omit error key: %v", m)
 	}
 	f2 := &fakeCaller{}
-	if err := NewHostBridge(f2.call).StreamCloseDownstream("down-stream-7", "upstream failed"); err != nil {
+	if err := NewHostBridge(f2.call).StreamCloseDownstream("down-stream-7", errclass.PostFirstByteNetwork("upstream failed")); err != nil {
 		t.Fatalf("StreamCloseDownstream with error: %v", err)
 	}
 	m2 := decodePayload(t, f2.callsOf(pluginabi.MethodHostStreamClose)[0])
-	if len(m2) != 2 || m2["error"] != "upstream failed" {
+	detail, _ := m2["error_detail"].(map[string]any)
+	if len(m2) != 3 || m2["error"] != "upstream failed" || detail["code"] != "stream_truncated" ||
+		detail["http_status"] != float64(502) || detail["message"] != "upstream failed" {
 		t.Fatalf("wire payload wrong: %v", m2)
 	}
 	err := NewHostBridge((&fakeCaller{responder: func(string, []byte) ([]byte, error) {
 		return hostErr("gone", "no such stream"), nil
-	}}).call).StreamCloseDownstream("down-stream-7", "x")
+	}}).call).StreamCloseDownstream("down-stream-7", errclass.PostFirstByteNetwork("x"))
 	if err == nil || !strings.Contains(err.Error(), "no such stream") {
 		t.Fatalf("err = %v", err)
 	}

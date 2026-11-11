@@ -14,6 +14,8 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+
+	"opencode-go-cliproxyapi/internal/errclass"
 )
 
 // RawCaller performs one host callback round-trip: method name plus JSON
@@ -403,13 +405,18 @@ func (b *HostBridge) StreamEmit(downstreamStreamID string, payload []byte) error
 }
 
 // StreamCloseDownstream terminates a DOWNSTREAM stream, optionally with a
-// redacted error label. Bounded by emitTimeout like StreamEmit: on a wedged
+// classified error sent as both a redacted label and error_detail. Bounded by emitTimeout like StreamEmit: on a wedged
 // downstream consumer the close itself is what must not block.
-func (b *HostBridge) StreamCloseDownstream(downstreamStreamID string, errMsg string) error {
+func (b *HostBridge) StreamCloseDownstream(downstreamStreamID string, downErr *errclass.Error) error {
 	req := struct {
-		StreamID string `json:"stream_id"`
-		Error    string `json:"error,omitempty"`
-	}{downstreamStreamID, errMsg}
+		StreamID    string              `json:"stream_id"`
+		Error       string              `json:"error,omitempty"`
+		ErrorDetail *errclass.WireError `json:"error_detail,omitempty"`
+	}{StreamID: downstreamStreamID}
+	if downErr != nil {
+		detail := errclass.ToEnvelopeError(downErr)
+		req.Error, req.ErrorDetail = detail.Message, &detail
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), emitTimeout)
 	defer cancel()
 	_, err := b.invoke(ctx, pluginabi.MethodHostStreamClose, req, "host stream close")

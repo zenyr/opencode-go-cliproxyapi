@@ -528,6 +528,7 @@ func TestAnthropicErrorStatusTable(t *testing.T) {
 		"not_found_error":        404,
 		"request_too_large":      413,
 		"rate_limit_error":       429,
+		"GoUsageLimitError":      429,
 		"overloaded_error":       503,
 		"api_error":              500,
 		"some_future_error_type": 500,
@@ -907,5 +908,15 @@ func TestStreamResponsesNamespaceRestored(t *testing.T) {
 	}
 	if fc := output[0].(map[string]any); fc["name"] != "spawn_agent" || fc["namespace"] != "subagents" {
 		t.Fatalf("terminal identity not restored: %v", fc)
+	}
+}
+
+func TestStreamUsageLimitErrorIsCredentialScoped(t *testing.T) {
+	sc := NewStreamConverter("openai")
+	_, _, eErr := feed(t, sc,
+		"data: {\"type\":\"error\",\"error\":{\"type\":\"GoUsageLimitError\",\"message\":\"Go usage limit exceeded\"}}\n\n",
+	)
+	if eErr == nil || eErr.Class != errclass.ClassQuota || !eErr.CredentialScoped || eErr.StatusCode != 429 {
+		t.Fatalf("want credential-scoped quota 429, got %+v", eErr)
 	}
 }

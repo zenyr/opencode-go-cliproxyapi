@@ -864,7 +864,7 @@ func TestExecuteStreamOpenTransportError(t *testing.T) {
 		t.Fatalf("execute_stream: %v", err)
 	}
 	env := decodeEnv(t, resp)
-	if env.OK || env.Error == nil || env.Error.Code != string(errclass.ClassNetwork) || !env.Error.Retryable {
+	if env.OK || env.Error == nil || env.Error.Code != errclass.CodeTransientTransport || !env.Error.Retryable {
 		t.Fatalf("envelope = %+v", env.Error)
 	}
 	if got := len(f.callsOf(pluginabi.MethodHostStreamEmit)); got != 0 {
@@ -968,6 +968,7 @@ func TestExecuteStreamEmitFailsMidstream(t *testing.T) {
 	if len(downCloses) != 1 || !strings.Contains(string(downCloses[0].payload), `"error"`) {
 		t.Fatalf("downstream must close with error: %v", downCloses)
 	}
+	assertCloseCode(t, downCloses[0], errclass.CodeConnectionLifecycle)
 }
 
 func TestExecuteStreamPartialLineDroppedOnCleanClose(t *testing.T) {
@@ -1170,6 +1171,78 @@ func TestExecuteStreamUpstreamErrorLabel(t *testing.T) {
 	if len(downCloses) != 1 || !strings.Contains(string(downCloses[0].payload), "upstream exploded") {
 		t.Fatalf("downstream close missing label: %v", downCloses)
 	}
+	assertCloseCode(t, downCloses[0], errclass.CodeStreamTruncated)
+}
+
+// assertCloseCode checks the structured error_detail on a downstream close.
+func assertCloseCode(t *testing.T, call capturedCall, code string) map[string]any {
+	t.Helper()
+	detail, _ := decodePayload(t, call)["error_detail"].(map[string]any)
+	if detail["code"] != code {
+		t.Fatalf("error_detail code = %v, want %q: %s", detail["code"], code, call.payload)
+	}
+	return detail
+}
+
+func TestExecuteStreamInStreamUsageLimitIsCredentialScoped(t *testing.T) {
+	m, f := newStreamManager(t, streamScript{
+		upstreamID: "up-q",
+		frames: []string{
+			`data: {"error":{"type":"GoUsageLimitError","message":"Go usage limit exceeded"}}` + "\n\n",
+		},
+	})
+	resp, err := m.HandleCall("executor.execute_stream",
+		execStreamReqBody("opencode-go/glm-5.3", "claude", []byte(ccRequestBody), "down-9"))
+	if err != nil {
+		t.Fatalf("execute_stream: %v", err)
+	}
+	if env := decodeEnv(t, resp); !env.OK {
+		t.Fatalf("execute_stream initial envelope = %+v", env.Error)
+	}
+	m.bridge.WaitForInFlight(5 * time.Second)
+	downCloses := f.callsOf(pluginabi.MethodHostStreamClose)
+	if len(downCloses) != 1 {
+		t.Fatalf("downstream closes = %d, want 1", len(downCloses))
+	}
+	detail := assertCloseCode(t, downCloses[0], string(errclass.ClassQuota))
+	if detail["credential_scoped"] != true || detail["http_status"] != float64(429) {
+		t.Fatalf("error_detail = %v, want credential-scoped 429", detail)
+	}
+}
+
+func TestExecuteUsageLimitEnvelopeCarriesScopeAndRetryAfter(t *testing.T) {
+	f := &fakeCaller{}
+	m := NewManager(NewHostBridge(f.call))
+	t.Cleanup(func() { _, _ = m.HandleCall("plugin.shutdown", nil) })
+	f.responder = wrapWithCatalog(testCatalogJSON, func(method string, _ []byte) ([]byte, error) {
+		if method != pluginabi.MethodHostHTTPDo {
+			return hostOK(map[string]any{}), nil
+		}
+		return hostOK(pluginapi.HTTPResponse{
+			StatusCode: http.StatusTooManyRequests,
+			Headers:    http.Header{"Retry-After": []string{"120"}},
+			Body:       []byte(`{"type":"error","error":{"type":"GoUsageLimitError","message":"Go usage limit exceeded"}}`),
+		}), nil
+	})
+	if _, err := m.HandleCall("plugin.register", lifecycleRequestBody(testValidYAML)); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+	resp, err := m.HandleCall("executor.execute", execReqBody("opencode-go/glm-5.3", "openai", []byte(ccRequestBody), false))
+	if err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	var env struct {
+		OK    bool               `json:"ok"`
+		Error errclass.WireError `json:"error"`
+	}
+	if err := json.Unmarshal(resp, &env); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	want := errclass.WireError{Code: "quota_exhaustion", Message: "Go usage limit exceeded", Retryable: true,
+		HTTPStatus: 429, RetryAfterSeconds: 120, CredentialScoped: true}
+	if env.OK || env.Error != want {
+		t.Fatalf("envelope = %+v, want %+v", env.Error, want)
+	}
 }
 
 func TestExecuteStreamConverterError(t *testing.T) {
@@ -1194,6 +1267,7 @@ func TestExecuteStreamConverterError(t *testing.T) {
 	if len(downCloses) != 1 || !strings.Contains(string(downCloses[0].payload), `"error"`) {
 		t.Fatalf("downstream must close with error: %v", downCloses)
 	}
+	assertCloseCode(t, downCloses[0], errclass.CodeStreamTruncated)
 }
 
 // F1 pin: a retryable-classified converter error arriving AFTER events
@@ -1363,7 +1437,7 @@ func TestExecuteTransportErrorClassified(t *testing.T) {
 		t.Fatalf("register: %v", err)
 	}
 	env := mustExecute(t, m, "opencode-go/glm-5.3", "openai", []byte(ccRequestBody))
-	if env.OK || env.Error == nil || env.Error.Code != string(errclass.ClassNetwork) {
+	if env.OK || env.Error == nil || env.Error.Code != errclass.CodeTransientTransport {
 		t.Fatalf("envelope = %+v", env.Error)
 	}
 }

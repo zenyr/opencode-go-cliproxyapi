@@ -17,7 +17,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 
 	"opencode-go-cliproxyapi/internal/adapter/chatcompletions"
@@ -120,7 +119,7 @@ func (m *Manager) handleExecute(request []byte) ([]byte, error) {
 	}
 	debugTrace("executor received non-stream status=%d body_len=%d", resp.StatusCode, len(resp.Body))
 	if resp.StatusCode >= 400 {
-		return classEnvelope(shared.UpstreamStatusError(resp.StatusCode, resp.Body)), nil
+		return classEnvelope(upstreamStatusError(resp.StatusCode, resp.Headers, resp.Body)), nil
 	}
 	// Parse/envelope guard only; true OOM prevention belongs to the host transport's byte cap.
 	if int64(len(resp.Body)) > res.cfg.MaxResponseBytes {
@@ -303,12 +302,27 @@ func convertNonStream(route catalog.Route, sourceFormat string, status int, body
 	return nil, errclass.Translation("unsupported route")
 }
 
+// errorEnvelope is pluginabi.Envelope with the v8 error fields that the
+// pinned v7 SDK lacks.
+type errorEnvelope struct {
+	OK    bool                `json:"ok"`
+	Error *errclass.WireError `json:"error,omitempty"`
+}
+
 // classEnvelope renders a classified failure as the wire error envelope;
-// ToEnvelopeError redacts and propagates Retryable/HTTPStatus host-side.
+// ToEnvelopeError redacts and propagates the routing fields host-side.
 func classEnvelope(e *errclass.Error) []byte {
 	wire := errclass.ToEnvelopeError(e)
-	out, _ := json.Marshal(pluginabi.Envelope{OK: false, Error: &wire})
+	out, _ := json.Marshal(errorEnvelope{Error: &wire})
 	return out
+}
+
+// upstreamStatusError classifies an upstream >=400 response and attaches
+// its Retry-After hint.
+func upstreamStatusError(status int, headers http.Header, body []byte) *errclass.Error {
+	e := shared.UpstreamStatusError(status, body)
+	e.RetryAfterSeconds = shared.RetryAfterSeconds(headers, time.Now())
+	return e
 }
 
 // streamConverter is the common shape of the three adapters' stream
@@ -371,7 +385,7 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 	debugTrace("executor sending stream url=%s body_len=%d", url, len(upstreamBody))
 	ctx, cancel := context.WithTimeout(context.Background(), res.cfg.RequestTimeout)
 	defer cancel()
-	st, _, id, err := m.bridge.DoStream(ctx, pluginapi.HTTPRequest{
+	st, headers, id, err := m.bridge.DoStream(ctx, pluginapi.HTTPRequest{
 		Method:  http.MethodPost,
 		URL:     url,
 		Headers: upstreamAuthHeaders(res.rec.Protocol, res.key, sessionID),
@@ -391,7 +405,7 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 			watchdog.Stop()
 			_ = m.bridge.StreamClose(id)
 		}
-		return classEnvelope(shared.UpstreamStatusError(st, body)), nil
+		return classEnvelope(upstreamStatusError(st, headers, body)), nil
 	}
 
 	downID := req.StreamID
@@ -409,13 +423,13 @@ func (m *Manager) executeStream(req executorRequest) ([]byte, error) {
 
 func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, sourceFormat string) {
 	var closeOnce sync.Once
-	closeStreams := func(downErrMsg string) {
+	closeStreams := func(downErr *errclass.Error) {
 		closeOnce.Do(func() {
 			_ = m.bridge.StreamClose(upstreamID)
-			_ = m.bridge.StreamCloseDownstream(downID, downErrMsg)
+			_ = m.bridge.StreamCloseDownstream(downID, downErr)
 		})
 	}
-	defer closeStreams("")
+	defer closeStreams(nil)
 
 	var aborted atomic.Bool
 	watchdog := time.AfterFunc(res.cfg.RequestTimeout, func() {
@@ -440,29 +454,29 @@ func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, 
 		debugTrace("executor stream read chunk_len=%d closed=%t readErrMsg=%q err=%v", len(payload), closed, readErrMsg, err)
 		upstreamClosed = closed
 		if aborted.Load() {
-			closeStreams(errclass.Redact("stream exceeded request-timeout"))
+			closeStreams(errclass.PostFirstByteNetwork("stream exceeded request-timeout"))
 			return
 		}
 		if err != nil {
-			closeStreams(errclass.Redact(err.Error()))
+			closeStreams(errclass.PostFirstByteNetwork(err.Error()))
 			return
 		}
 		if readErrMsg != "" {
-			closeStreams(errclass.Redact(readErrMsg))
+			closeStreams(errclass.PostFirstByteNetwork(readErrMsg))
 			return
 		}
 		total += int64(len(payload))
 		if total > res.cfg.MaxResponseBytes {
-			closeStreams(errclass.Redact("stream exceeded max-response-bytes"))
+			closeStreams(errclass.PostFirstByteNetwork("stream exceeded max-response-bytes"))
 			return
 		}
 		events, done, convErr := conv.Feed(payload)
 		if convErr != nil {
-			closeStreams(errclass.Redact(convErr.Message))
+			closeStreams(streamFeedError(convErr))
 			return
 		}
 		if emitErr := m.emitAll(downID, events); emitErr != nil {
-			closeStreams(errclass.Redact(emitErr.Error()))
+			closeStreams(errclass.DownstreamLifecycle(emitErr.Error()))
 			return
 		}
 		convDone = done
@@ -475,11 +489,21 @@ func (m *Manager) pumpStream(downID, upstreamID string, res *resolvedExecution, 
 		if flusher, ok := conv.(interface{ Flush() [][]byte }); ok {
 			flushed := flusher.Flush()
 			if emitErr := m.emitAll(downID, flushed); emitErr != nil {
-				closeStreams(errclass.Redact(emitErr.Error()))
+				closeStreams(errclass.DownstreamLifecycle(emitErr.Error()))
 				return
 			}
 		}
 	}
+}
+
+// streamFeedError keeps an upstream in-stream error's classification. A
+// local translation failure becomes stream_truncated: it is neither the
+// key's fault nor safe to replay.
+func streamFeedError(e *errclass.Error) *errclass.Error {
+	if e.Class == errclass.ClassTranslation {
+		return errclass.PostFirstByteNetwork(e.Message)
+	}
+	return e
 }
 
 // emitAll feeds converted events downstream in order. StreamEmit is

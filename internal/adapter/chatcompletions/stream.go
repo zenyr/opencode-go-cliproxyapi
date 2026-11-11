@@ -247,6 +247,7 @@ func (sc *StreamConverter) decodeChunk(data string) (*ccChunk, *errclass.Error) 
 // server failure.
 func chunkError(e *ccChunkError) *errclass.Error {
 	status := 0
+	code := e.Type
 	switch c := e.Code.(type) {
 	case float64:
 		status = int(c)
@@ -255,13 +256,15 @@ func chunkError(e *ccChunkError) *errclass.Error {
 			status = n
 		} else if strings.Contains(c, "rate_limit") {
 			status = 429
+		} else if errclass.IsQuotaCode(c) {
+			code = c
 		}
 	}
-	if status == 0 && strings.Contains(e.Type, "rate_limit") {
+	if status == 0 && (strings.Contains(e.Type, "rate_limit") || errclass.IsQuotaCode(code)) {
 		status = 429
 	}
 	if status > 0 {
-		return errclass.FromStatus(status, e.Message)
+		return errclass.FromStatusCode(status, code, e.Message)
 	}
 	return errclass.UpstreamFallback(e.Message)
 }

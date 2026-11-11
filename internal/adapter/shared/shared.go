@@ -7,6 +7,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -816,11 +818,11 @@ func RedactedSnippet(s string) string {
 // truncates to this size before scanning (FR-011).
 const snippetBound = 4096
 
-// extractErrorMessage attempts to extract a clean, human-readable error
+// extractError reads the error type/code and a clean, human-readable
 // message from upstream JSON error bodies (e.g. OpenAI or Anthropic format).
-func extractErrorMessage(body []byte) string {
+func extractError(body []byte) (code, message string) {
 	if len(body) == 0 {
-		return ""
+		return "", ""
 	}
 	var probe struct {
 		Error   any    `json:"error"`
@@ -828,41 +830,67 @@ func extractErrorMessage(body []byte) string {
 		Detail  string `json:"detail"`
 	}
 	if err := json.Unmarshal(body, &probe); err != nil {
-		return ""
+		return "", ""
 	}
 	switch v := probe.Error.(type) {
 	case string:
-		if v != "" {
-			return strings.TrimSpace(v)
-		}
+		message = strings.TrimSpace(v)
 	case map[string]any:
-		if m, ok := v["message"].(string); ok && m != "" {
-			return strings.TrimSpace(m)
+		code, _ = v["type"].(string)
+		if c, _ := v["code"].(string); errclass.IsQuotaCode(c) {
+			code = c
+		}
+		if m, ok := v["message"].(string); ok {
+			message = strings.TrimSpace(m)
 		}
 	}
-	if probe.Message != "" {
-		return strings.TrimSpace(probe.Message)
+	if message == "" {
+		message = strings.TrimSpace(probe.Message)
 	}
-	if probe.Detail != "" {
-		return strings.TrimSpace(probe.Detail)
+	if message == "" {
+		message = strings.TrimSpace(probe.Detail)
 	}
-	return ""
+	return code, message
 }
 
 // UpstreamStatusError classifies an upstream >=400 response body into one
 // kernel used by every adapter and the executor: the body is truncated to
 // its head, decoded for human-readable error messages if JSON, or fallen
-// back to a redacted snippet, then classified per §7 via errclass.FromStatus.
-// One kernel keeps bounding and redaction from diverging across call sites.
+// back to a redacted snippet, then classified per §7 via
+// errclass.FromStatusCode. One kernel keeps bounding and redaction from
+// diverging across call sites.
 func UpstreamStatusError(status int, body []byte) *errclass.Error {
 	if len(body) > snippetBound {
 		body = body[:snippetBound]
 	}
-	msg := extractErrorMessage(body)
+	code, msg := extractError(body)
 	if msg == "" {
 		msg = string(body)
 	}
-	return errclass.FromStatus(status, RedactedSnippet(msg))
+	return errclass.FromStatusCode(status, code, RedactedSnippet(msg))
+}
+
+// maxRetryAfter bounds an upstream Retry-After hint to one week.
+const maxRetryAfter = 7 * 24 * time.Hour
+
+// RetryAfterSeconds parses a Retry-After header (delta-seconds or HTTP
+// date). It returns 0 when the header is absent, invalid, or not positive.
+func RetryAfterSeconds(h http.Header, now time.Time) int {
+	v := strings.TrimSpace(h.Get("Retry-After"))
+	if v == "" {
+		return 0
+	}
+	var d time.Duration
+	if n, err := strconv.Atoi(v); err == nil {
+		d = time.Duration(n) * time.Second
+	} else if t, err := http.ParseTime(v); err == nil {
+		d = t.Sub(now)
+	}
+	if d <= 0 {
+		return 0
+	}
+	d = min(d, maxRetryAfter)
+	return int((d + time.Second - 1) / time.Second)
 }
 
 // ResponsesUsage is the token-usage block of synthesized Responses

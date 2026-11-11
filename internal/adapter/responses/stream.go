@@ -173,6 +173,8 @@ type usageCounts struct {
 
 type errorMessage struct {
 	Message string `json:"message"`
+	Code    string `json:"code"`
+	Type    string `json:"type"`
 }
 
 type responseMeta struct {
@@ -681,8 +683,15 @@ func failureError(ev *failureEvent) *errclass.Error {
 	if msg == "" {
 		msg = ev.Response.Error.Message
 	}
+	code := ev.Response.Error.Type
+	if errclass.IsQuotaCode(ev.Response.Error.Code) {
+		code = ev.Response.Error.Code
+	}
+	if status == 0 && errclass.IsQuotaCode(code) {
+		status = 429
+	}
 	if status > 0 {
-		return errclass.FromStatus(status, msg)
+		return errclass.FromStatusCode(status, code, msg)
 	}
 	return errclass.UpstreamFallback(msg)
 }

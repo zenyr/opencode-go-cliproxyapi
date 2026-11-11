@@ -495,13 +495,18 @@ func (sc *StreamConverter) captureCache(u usageCounts) {
 func sseError(e map[string]any) *errclass.Error {
 	errorType := sget(e, "type")
 	message := sget(e, "message")
-	if strings.Contains(strings.ToLower(errorType), "gousagelimiterror") || strings.Contains(strings.ToLower(errorType), "freeusagelimiterror") {
+	if errclass.IsQuotaCode(errorType) {
 		message = errorType + ": " + message
 	}
-	return errclass.FromStatus(anthropicErrorStatus(errorType), message)
+	return errclass.FromStatusCode(anthropicErrorStatus(errorType), errorType, message)
 }
 
+// anthropicErrorStatus maps an error type to its HTTP status. OpenCode's
+// account-cap types arrive as 429 on the HTTP path, so they map to 429 here.
 func anthropicErrorStatus(t string) int {
+	if errclass.IsQuotaCode(t) {
+		return 429
+	}
 	switch t {
 	case "invalid_request_error":
 		return 400

@@ -5,8 +5,6 @@ package errclass
 import (
 	"regexp"
 	"strings"
-
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 )
 
 // Class is a stable error-category identifier (FR-009) used as the
@@ -25,12 +23,53 @@ const (
 	ClassTranslation  Class = "translation_failure"
 )
 
+// Host routing codes recognized by CPA v8 (pluginabi.ErrorCode*). The
+// pinned v7 SDK predates them, so they are mirrored here.
+const (
+	CodeTransientTransport  = "transient_transport"
+	CodeStreamTruncated     = "stream_truncated"
+	CodeConnectionLifecycle = "connection_lifecycle"
+)
+
 // Error describes classified request errors and retryability for CPA execution.
 type Error struct {
 	Class      Class
 	Message    string
 	StatusCode int
 	Retryable  bool
+	// RoutingCode replaces Class as the wire code when CPA needs a routing hint.
+	RoutingCode string
+	// CredentialScoped marks a failure that blocks the whole API key.
+	CredentialScoped bool
+	// RetryAfterSeconds carries the upstream Retry-After hint.
+	RetryAfterSeconds int
+}
+
+// WireError is the host error shape (pluginabi.Error in CPA v8). It is used
+// for RPC envelopes and stream error_detail.
+type WireError struct {
+	Code              string `json:"code"`
+	Message           string `json:"message"`
+	Retryable         bool   `json:"retryable,omitempty"`
+	HTTPStatus        int    `json:"http_status,omitempty"`
+	RetryAfterSeconds int    `json:"retry_after_seconds,omitempty"`
+	CredentialScoped  bool   `json:"credential_scoped,omitempty"`
+}
+
+// quotaCodes are upstream error types that report an account cap rather
+// than a throttle. The list follows OpenCode's own QUOTA_CODES.
+var quotaCodes = map[string]bool{
+	"gousagelimiterror":   true,
+	"freeusagelimiterror": true,
+	"creditlimitexceeded": true,
+	"insufficient_quota":  true,
+	"usage_not_included":  true,
+	"billing_error":       true,
+}
+
+// IsQuotaCode reports whether an upstream error type or code is an account cap.
+func IsQuotaCode(code string) bool {
+	return quotaCodes[strings.ToLower(strings.TrimSpace(code))]
 }
 
 func (e *Error) Error() string {
@@ -38,14 +77,24 @@ func (e *Error) Error() string {
 }
 
 // FromStatus classifies an upstream HTTP status per resolved §7.
-// Network/timeout failures (no status) use FromNetwork instead. A redacted
-// message containing "quota" (case-insensitive) upgrades 429/402/403 to
-// ClassQuota — a bounded heuristic given no documented upstream quota
-// taxonomy.
+// Network/timeout failures (no status) use FromNetwork instead.
 func FromStatus(status int, message string) *Error {
+	return FromStatusCode(status, "", message)
+}
+
+// FromStatusCode classifies like FromStatus and also reads the upstream
+// error type/code. A quota code, or a redacted message containing "quota",
+// upgrades 429/402/403 to ClassQuota. A 429 quota is credential-scoped: the
+// OpenCode Go caps apply to the whole key across all models.
+func FromStatusCode(status int, code, message string) *Error {
+	e := fromStatus(status, IsQuotaCode(code), message)
+	e.CredentialScoped = e.Class == ClassQuota && status == 429
+	return e
+}
+
+func fromStatus(status int, quotaCode bool, message string) *Error {
 	msg := Redact(message)
-	lowerMsg := strings.ToLower(msg)
-	quota := strings.Contains(lowerMsg, "quota")
+	quota := quotaCode || strings.Contains(strings.ToLower(msg), "quota")
 	quotaClass := func(base Class) Class {
 		if quota {
 			return ClassQuota
@@ -71,22 +120,29 @@ func FromStatus(status int, message string) *Error {
 }
 
 // FromNetwork classifies a PRE-first-byte network/timeout failure; always
-// retryable (§7). Failures observed after the first upstream byte must use
+// retryable (§7). CPA skips credential cooldown for transient_transport.
+// Failures observed after the first upstream byte must use
 // PostFirstByteNetwork instead.
 func FromNetwork(err error) *Error {
 	msg := ""
 	if err != nil {
 		msg = Redact(err.Error())
 	}
-	return &Error{Class: ClassNetwork, Message: msg, Retryable: true}
+	return &Error{Class: ClassNetwork, Message: msg, Retryable: true, RoutingCode: CodeTransientTransport}
 }
 
-// PostFirstByteNetwork classifies a network/timeout failure seen AFTER the
-// first upstream byte was received: part of the response may already be
-// delivered downstream, so a retry would risk duplicate delivery of a half
-// stream — never retryable (§7).
+// PostFirstByteNetwork classifies a failure seen AFTER the first upstream
+// byte: part of the response may already be delivered downstream, so a
+// retry would risk duplicate delivery of a half stream — never retryable
+// (§7). CPA neither cools the key nor replays a stream_truncated failure.
 func PostFirstByteNetwork(msg string) *Error {
-	return &Error{Class: ClassNetwork, Message: Redact(msg), Retryable: false}
+	return &Error{Class: ClassNetwork, Message: Redact(msg), StatusCode: 502, RoutingCode: CodeStreamTruncated}
+}
+
+// DownstreamLifecycle classifies a failed delivery to the CPA downstream
+// stream. CPA skips credential cooldown for connection_lifecycle.
+func DownstreamLifecycle(msg string) *Error {
+	return &Error{Class: ClassNetwork, Message: Redact(msg), RoutingCode: CodeConnectionLifecycle}
 }
 
 // Translation reports an FR-005/FR-006 translation failure; never retryable.
@@ -102,11 +158,11 @@ func UpstreamFallback(msg string) *Error {
 	return &Error{Class: ClassUpstream, Message: Redact(msg), Retryable: true}
 }
 
-// ToEnvelopeError converts to the shared SDK wire type with a redacted
+// ToEnvelopeError converts to the host wire type with a redacted
 // message. Re-redacting at the envelope edge is INTENTIONAL defense-in-depth:
 // constructors already redact (so non-envelope consumers — logs, executor
 // fail paths reading .Message directly) are safe, and Redact is idempotent.
-func ToEnvelopeError(e *Error) pluginabi.Error {
+func ToEnvelopeError(e *Error) WireError {
 	status := e.StatusCode
 	if status == 0 {
 		switch e.Class {
@@ -114,11 +170,17 @@ func ToEnvelopeError(e *Error) pluginabi.Error {
 			status = 400
 		}
 	}
-	return pluginabi.Error{
-		Code:       string(e.Class),
-		Message:    Redact(e.Message),
-		Retryable:  e.Retryable,
-		HTTPStatus: status,
+	code := e.RoutingCode
+	if code == "" {
+		code = string(e.Class)
+	}
+	return WireError{
+		Code:              code,
+		Message:           Redact(e.Message),
+		Retryable:         e.Retryable,
+		HTTPStatus:        status,
+		RetryAfterSeconds: e.RetryAfterSeconds,
+		CredentialScoped:  e.CredentialScoped,
 	}
 }
 
