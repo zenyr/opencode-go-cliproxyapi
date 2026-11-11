@@ -8,6 +8,7 @@ Full OpenAI Codex CLI support across all models: multi-agent namespaces, custom 
 
 ### Bug Fixes
 
+- Send CPA v8 routing hints with plugin errors: OpenCode Go account caps (`GoUsageLimitError` and similar) on 429 report `credential_scoped`, upstream `Retry-After` becomes `retry_after_seconds`, pre-response network failures report `transient_transport`, and failed streams close with a structured `error_detail` (`stream_truncated` or `connection_lifecycle`).
 - Fix missing Responses stream item lifecycle completion events (output_text.done, content_part.done, function_call_arguments.done, output_item.done) prior to response.completed, resolving dropped assistant output and tool calls in OpenAI Codex CLI and strict Responses clients.
 - Fix handling of in-history messages with role: "system" across protocol adapters without rejecting them as unsupported roles or forwarding invalid turn roles to upstream providers that require alternating user/assistant turns.
 - Fix handling of multi-part content arrays in function_call_output.output under /v1/responses decoding.
