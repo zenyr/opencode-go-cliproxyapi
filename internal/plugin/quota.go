@@ -109,11 +109,21 @@ func quotaJSON(v any) (pluginapi.ManagementResponse, error) {
 	return pluginapi.ManagementResponse{Headers: http.Header{"Content-Type": []string{"application/json"}}, Body: body}, nil
 }
 
+// maxQuotaTimeout bounds quota lookups, which serve interactive management calls.
+const maxQuotaTimeout = 30 * time.Second
+
+func quotaTimeout(requestTimeout time.Duration) time.Duration {
+	if requestTimeout <= 0 || requestTimeout > maxQuotaTimeout {
+		return maxQuotaTimeout
+	}
+	return requestTimeout
+}
+
 func fetchQuota(ctx context.Context, bridge *HostBridge, baseURL string, timeout time.Duration, key string) (quotaUsage, error) {
 	if bridge == nil {
 		return quotaUsage{}, fmt.Errorf("quota bridge unavailable")
 	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
+	ctx, cancel := context.WithTimeout(ctx, quotaTimeout(timeout))
 	defer cancel()
 	resp, err := bridge.Do(ctx, pluginapi.HTTPRequest{Method: http.MethodGet, URL: strings.TrimRight(baseURL, "/") + "/usage", Headers: http.Header{"Authorization": []string{"Bearer " + key}, "Accept": []string{"application/json"}}})
 	if err != nil || resp.StatusCode != http.StatusOK {

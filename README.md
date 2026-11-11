@@ -32,6 +32,7 @@ This plugin exposes OpenCode Go as a single provider (`opencode-go`) backed by a
 - **Dynamic Catalog Discovery**: Fetches remote model catalogs with local fallback and custom route overrides.
 - **Multi-Key Auth Scheduling**: Pools multiple API keys with CLIProxyAPI's native scheduler for rotation, retries, and error cooldowns across all protocols.
 - **OpenCode Go Quota Page**: Management Center includes a separate `OpenCode Go Quota` page. Page load lists credentials without contacting OpenCode; each card is refreshed manually and independently, and quota values do not affect routing or CPA's native quota page.
+- **Native Quota Provider**: On CLIProxyAPI `v7.2.159+` (including v8), the plugin also registers as a quota provider, so each OpenCode Go credential reports `supports_quota` in `/v0/management/auth-files` and its rolling (reported as the `5h` window), weekly, and monthly windows are served by `POST /v0/management/quota/fetch` (v8 Management API: `POST /v8/management/plugins/opencode-go-cliproxyapi/quota`). Quota reset is unsupported. Older hosts ignore the capability and keep using the separate page.
 
 ## Requirements
 

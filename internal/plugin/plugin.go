@@ -128,6 +128,8 @@ func (m *Manager) HandleCall(method string, request []byte) (resp []byte, err er
 		return m.registerManagement(request)
 	case pluginabi.MethodManagementHandle:
 		return m.handleManagement(request)
+	case methodQuotaIdentifier, methodQuotaDescribe, methodQuotaFetch, methodQuotaReset:
+		return m.handleNativeQuota(method, request), nil
 	case pluginabi.MethodExecutorIdentifier:
 		return okEnvelope(map[string]string{"identifier": ProviderID}), nil
 	case pluginabi.MethodExecutorCountTokens:
@@ -160,6 +162,7 @@ type capabilities struct {
 	ExecutorInputFormats  []string                     `json:"executor_input_formats,omitempty"`
 	ExecutorOutputFormats []string                     `json:"executor_output_formats,omitempty"`
 	ManagementAPI         bool                         `json:"management_api"`
+	QuotaProvider         bool                         `json:"quota_provider"`
 }
 
 type registrationResult struct {
@@ -242,6 +245,7 @@ func registrationEnvelope() []byte {
 			ExecutorInputFormats:  formats,
 			ExecutorOutputFormats: formats,
 			ManagementAPI:         true,
+			QuotaProvider:         true,
 		},
 	})
 }

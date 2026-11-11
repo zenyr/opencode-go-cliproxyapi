@@ -2,6 +2,10 @@
 
 Full OpenAI Codex CLI support across all models: multi-agent namespaces, custom programmatic tools (`exec`), tool call results, and reasoning efforts are fully functional.
 
+### Features
+
+- Register as a native CLIProxyAPI quota provider: on hosts `v7.2.159+` (including v8), OpenCode Go credentials report `supports_quota` in `/v0/management/auth-files` and serve rolling, weekly, and monthly windows through `POST /v0/management/quota/fetch`. The plugin keeps schema version 3, so older v7 hosts still load it and keep using the separate `OpenCode Go Quota` page. Quota lookups are now capped at 30 seconds.
+
 ### Bug Fixes
 
 - Fix missing Responses stream item lifecycle completion events (output_text.done, content_part.done, function_call_arguments.done, output_item.done) prior to response.completed, resolving dropped assistant output and tool calls in OpenAI Codex CLI and strict Responses clients.
